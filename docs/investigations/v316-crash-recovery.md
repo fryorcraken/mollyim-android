@@ -88,7 +88,14 @@ adb install -r -d molly-foss-<ver>.apk
   APK/key; get the matching Molly‑FOSS APK.
 - **Fails on downgrade** (`INSTALL_FAILED_VERSION_DOWNGRADE`) → `adb -d`
   downgrade is blocked on this Android build → see *If neither strategy is
-  available* below.
+  available* below. **On modern Android this is the likely outcome for a retail
+  device**: `pm install -d`'s own help states *"allow version code downgrade
+  (debuggable packages only)"*, so a release-signed app on a locked,
+  non-debuggable phone (e.g. a stock Pixel on Android 12+) **cannot** be
+  downgraded in place by any `adb`/`pm` flag. `--enable-rollback` governs
+  update-then-rollback, not a fresh older-APK install, and does not help.
+  Confirmed unfixable without root/unlock on a Pixel 10a / Android 17 — see
+  *Session findings* at the bottom.
 
 ### 5. Export a real backup — immediately
 In the now-working app: Settings → Chats → Backups (or the local backup
@@ -210,3 +217,89 @@ so every one of them is safe to replay.
 - The residual risk is file handling (owner/SELinux, stale WAL), mitigated by
   force-stopping first, keeping an untouched copy, checkpointing the WAL, and
   restoring ownership and context.
+
+---
+
+## Session findings (real recovery attempt, 2026-07-24)
+
+Learnings from actually running this on an affected device — a **Pixel 10a,
+Android 17, unrooted, locked bootloader, Molly-FOSS `v8.19.2-3` (DB 321)**
+installed via Accrescent, single on-device copy of the data.
+
+### The crash reproduces only *after* the passphrase unlock
+Molly's data-at-rest encryption means the SQLCipher database is not opened until
+the user enters the app passphrase. The V316 migration therefore runs — and
+crashes — **on unlock**, not at process start. Symptoms:
+
+- The process starts, loads `libsqlcipher.so`, and sits alive at the passphrase
+  screen; it only dies *after* the passphrase is entered.
+- With in-app debug logging disabled (the default privacy setting), the crash
+  **does not appear in `adb logcat`** — the stack trace never leaves the app.
+  Absence of a logcat trace is not evidence the crash is gone; reproduce it by
+  entering the passphrase and watching the process exit.
+
+### Strategy 1 is blocked on locked, non-debuggable Android 12+
+`adb install -r -d` and `pm install -r -d` both fail with
+`INSTALL_FAILED_VERSION_DOWNGRADE`. Root cause, straight from `pm`'s own help:
+
+> `-d: allow version code downgrade (debuggable packages only)`
+
+A retail device reports `ro.debuggable=0` and `ro.boot.flash.locked=1`, and
+Molly is release-signed (not debuggable), so **no `adb`/`pm` flag permits the
+in-place downgrade**. `--enable-rollback` is for update-then-rollback, not a
+fresh older-APK install. This was confirmed unfixable without rooting (which
+wipes a locked Pixel). Strategy 2 (root) and a self-built guarded APK (needs the
+**official** release signing key, cert `6aa80fdf…0886`) were likewise
+unavailable. On such a device the *only* zero-data-loss in-place fix is an
+official guarded Molly-FOSS release — see *If neither strategy is available*.
+
+### Only `v8.7.3-2` is a valid same-signed downgrade target
+Mapping **published Molly `-N` releases** (not bare Signal-upstream tags) to
+`DATABASE_VERSION` shows the DB version jumps **313 → 321** across releases;
+there is **no** Molly release at DB 314/315/316/317. So the highest release
+below 316 is **`v8.7.3-2` (DB 313)**. Its signing cert matches the installed app
+(`6aa80fdf4a8cc13737cfb434fc0cde486f09cf8fcda21a67bea5ee1ca2700886`), and its
+`GroupTable` has no `verified_name_hash`, confirming V316 has not yet run there.
+(This is moot when the downgrade is blocked as above, but documents the correct
+target.)
+
+### The real rescue was a native local backup — verify the key *before* wiping
+When a native Molly **local backup** exists, restoring it into current
+Molly-FOSS is the clean fix and sidesteps every in-place blocker. Before doing
+the irreversible uninstall, confirm the backup key is correct with a real
+decrypt-test, not a format check:
+
+- Tool: [`verify-backup-key/`](./verify-backup-key/) — a Rust binary that links
+  the **actual Molly libsignal fork** (tag `v0.96.3-1`, matching the app's
+  pinned `im.molly:libsignal-client`) so the derivation is byte-for-byte what
+  the app does. It reproduces `LocalArchiver.getBackupId` / `decryptBackupId`:
+  derives the metadata key from the AEP, decrypts the stored backup id, and
+  compares it to `deriveBackupId(AEP, ACI)`. A **MATCH** proves both the AEP and
+  the ACI are correct for that backup. It self-tests against libsignal's own
+  known-answer vector before trusting any result.
+- Inputs: the 64-char **AEP / Backup Key** (piped via stdin, kept out of shell
+  history) and your **ACI** (account UUID — not secret). The ACI can be read
+  from a linked Signal **Desktop** (`items.uuid_id` in its SQLCipher DB, or
+  DevTools `textsecure.storage.user.getAci()` where DevTools is enabled).
+
+### Local-backup on-disk layout gotcha (restore "Failed to load archive")
+A Molly local backup is a **`SignalBackups/` parent directory**, not a single
+snapshot folder:
+
+```
+SignalBackups/
+├── files/                         ← SHARED, content-addressed media blob store
+│   └── <ab>/<64-hex digest>          (00..ff sharded; the actual attachments)
+├── signal-backup-<timestamp-A>/   ← snapshot: main + files(manifest) + metadata
+└── signal-backup-<timestamp-B>/   ← snapshot: main + files(manifest) + metadata
+```
+
+Inside a snapshot, `main` is the encrypted message archive, `metadata` is the
+small protobuf (version + encrypted backup id), and **`files` is a *manifest*
+(a list of `@<64-hex>` digests), not the media itself** — the media lives in the
+sibling top-level `files/` store. Restore must be pointed at the **whole
+`SignalBackups/` parent** so the shared `files/` blob store is present; handing
+Molly only the snapshot folder can yield **"Failed to load archive."** The
+snapshot's `main` is the **legacy** (no `SBACKUP\x01` magic) format —
+`IV(16) || AES-256-CBC(gzip(frames)) || HMAC-SHA256(32)` — keyed by
+`MessageBackupKey::derive(backupKey, backupId, None)`.

@@ -1,0 +1,28 @@
+[package]
+name = "verify-backup-key"
+version = "0.1.0"
+edition = "2021"
+description = "Offline decrypt-test: does an AEP + ACI actually open a Molly local-archive backup?"
+
+[[bin]]
+name = "verify-backup-key"
+path = "src/main.rs"
+
+[dependencies]
+# The REAL Signal/Molly derivation — no reimplemented crypto.
+# Path points at the Molly libsignal fork checked out at tag v0.96.3-1,
+# matching the app's pinned `im.molly:libsignal-client = "0.96.3-1"`.
+libsignal-account-keys = { path = "/tmp/libsignal-molly/rust/account-keys" }
+libsignal-core = { path = "/tmp/libsignal-molly/rust/core" }
+
+# Only used to reproduce the metadata frame's AES-256-CTR decrypt
+# (Aes256Ctr32, counter=0) exactly as LocalArchiver.applyCipher does.
+aes = "0.8"
+ctr = "0.9"
+
+hex = "0.4"
+uuid = "1"
+
+# libsignal-account-keys' hash.rs references rand_core::OsRng (Argon2 salt gen,
+# a path we don't use); ensure the getrandom feature that gates it is enabled.
+rand_core = { version = "0.6", features = ["getrandom"] }
